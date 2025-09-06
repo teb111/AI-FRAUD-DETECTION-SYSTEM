@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# TypeScript build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.project
+.classpath
+.settings/
+
+# Logs
+logs/
+*.log
+combined.log
+error.log
+
+# ML Model files (except base model)
+models/fraud-detection-model/checkpoints/
+models/fraud-detection-model/training_data/
+models/fraud-detection-model/temp/
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Cache directories
+.npm/
+.eslintcache
+.cache/
+
+# Optional REPL history
+.node_repl_history
+
+# Debug files
+debug.log
