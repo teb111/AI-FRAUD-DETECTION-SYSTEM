@@ -1,9 +1,15 @@
 import * as tf from "@tensorflow/tfjs-node";
 import { redis } from "../utils/database";
+import path from "path";
+import fs from "fs";
 
 export class MLService {
   private model: tf.LayersModel | null = null;
   private readonly MODEL_VERSION_KEY = "ml:model:version";
+  private readonly MODEL_PATH = path.join(
+    __dirname,
+    "../../models/fraud-detection-model"
+  );
   private readonly FEATURE_NAMES = [
     "amount",
     "hour",
@@ -12,7 +18,23 @@ export class MLService {
     "deviceUserCount",
     "txCountLast24h",
     "avgAmountLast24h",
+    "txCountLast7d",
+    "avgAmountLast7d",
+    "uniqueDevicesLast24h",
   ];
+  private readonly FEATURE_STATS = {
+    // Feature normalization statistics
+    amount: { mean: 50000, std: 200000 },
+    hour: { mean: 12, std: 6.93 },
+    dayOfWeek: { mean: 3, std: 2 },
+    isNewDevice: { mean: 0.1, std: 0.3 },
+    deviceUserCount: { mean: 1.2, std: 0.5 },
+    txCountLast24h: { mean: 2.5, std: 3.2 },
+    avgAmountLast24h: { mean: 45000, std: 180000 },
+    txCountLast7d: { mean: 12, std: 15 },
+    avgAmountLast7d: { mean: 48000, std: 190000 },
+    uniqueDevicesLast24h: { mean: 1.1, std: 0.4 },
+  };
 
   constructor() {
     // Initialize model asynchronously
@@ -21,10 +43,16 @@ export class MLService {
 
   private async initializeModel() {
     try {
-      // Create a new model
+      // Try to load existing model first
+      if (await this.loadExistingModel()) {
+        console.log("Existing model loaded successfully");
+        return;
+      }
+
+      // Create a new model if no existing model found
       this.model = this.createModel();
 
-      // Initialize with random weights
+      // Initialize with dummy data to set up the model structure
       const dummy_x = tf.randomNormal([1, this.FEATURE_NAMES.length]);
       const dummy_y = tf.randomUniform([1, 1]);
 
@@ -37,26 +65,75 @@ export class MLService {
       dummy_x.dispose();
       dummy_y.dispose();
 
-      console.log("Model initialized successfully");
+      // Save the initialized model
+      await this.saveModel();
+
+      console.log("Model initialized and saved successfully");
     } catch (error) {
       console.error("Error initializing model:", error);
       this.model = null;
     }
   }
 
+  private async loadExistingModel(): Promise<boolean> {
+    try {
+      if (fs.existsSync(this.MODEL_PATH)) {
+        this.model = await tf.loadLayersModel(
+          `file://${this.MODEL_PATH}/model.json`
+        );
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error("Error loading existing model:", error);
+      return false;
+    }
+  }
+
+  private async saveModel(): Promise<void> {
+    if (!this.model) return;
+
+    try {
+      // Ensure directory exists
+      if (!fs.existsSync(this.MODEL_PATH)) {
+        fs.mkdirSync(this.MODEL_PATH, { recursive: true });
+      }
+
+      await this.model.save(`file://${this.MODEL_PATH}`);
+      console.log("Model saved successfully");
+    } catch (error) {
+      console.error("Error saving model:", error);
+    }
+  }
+
   private createModel(): tf.LayersModel {
     const model = tf.sequential();
 
-    // Input layer
+    // Input layer with batch normalization
     model.add(
       tf.layers.dense({
         inputShape: [this.FEATURE_NAMES.length],
-        units: 64,
+        units: 128,
         activation: "relu",
+        kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
       })
     );
 
-    // Hidden layer
+    model.add(tf.layers.batchNormalization());
+    model.add(tf.layers.dropout({ rate: 0.3 }));
+
+    // Hidden layers
+    model.add(
+      tf.layers.dense({
+        units: 64,
+        activation: "relu",
+        kernelRegularizer: tf.regularizers.l2({ l2: 0.001 }),
+      })
+    );
+
+    model.add(tf.layers.batchNormalization());
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+
     model.add(
       tf.layers.dense({
         units: 32,
@@ -72,35 +149,62 @@ export class MLService {
       })
     );
 
-    // Compile the model
+    // Compile the model with better optimizer settings
     model.compile({
       optimizer: tf.train.adam(0.001),
       loss: "binaryCrossentropy",
-      metrics: ["accuracy"],
+      metrics: ["accuracy", "precision", "recall"],
     });
 
     return model;
   }
 
   private async preprocessFeatures(transaction: any): Promise<tf.Tensor2D> {
-    const hour = new Date(transaction.createdAt).getHours();
-    const dayOfWeek = new Date(transaction.createdAt).getDay();
+    const hour = new Date(transaction.createdAt || Date.now()).getHours();
+    const dayOfWeek = new Date(transaction.createdAt || Date.now()).getDay();
 
     // Get device statistics from Redis
     const deviceKey = `device:${transaction.deviceId}`;
     const userCount = await redis.scard(deviceKey);
 
-    // Get transaction history
-    const txKey = `tx:${transaction.userId}:24h`;
-    const recentTxs = await redis.lrange(txKey, 0, -1);
-    const txCount = recentTxs.length;
+    // Get transaction history - last 24h
+    const tx24hKey = `tx:${transaction.userId}:24h`;
+    const recentTxs24h = await redis.lrange(tx24hKey, 0, -1);
+    const txCount24h = recentTxs24h.length;
 
-    // Calculate average amount
-    const amounts = recentTxs.map((tx) => JSON.parse(tx).amount);
-    const avgAmount =
-      amounts.length > 0
-        ? amounts.reduce((a, b) => a + b, 0) / amounts.length
+    // Get transaction history - last 7d
+    const tx7dKey = `tx:${transaction.userId}:7d`;
+    const recentTxs7d = await redis.lrange(tx7dKey, 0, -1);
+    const txCount7d = recentTxs7d.length;
+
+    // Calculate average amounts
+    const amounts24h = recentTxs24h.map((tx) => {
+      try {
+        return JSON.parse(tx).amount;
+      } catch {
+        return 0;
+      }
+    });
+    const avgAmount24h =
+      amounts24h.length > 0
+        ? amounts24h.reduce((a, b) => a + b, 0) / amounts24h.length
         : 0;
+
+    const amounts7d = recentTxs7d.map((tx) => {
+      try {
+        return JSON.parse(tx).amount;
+      } catch {
+        return 0;
+      }
+    });
+    const avgAmount7d =
+      amounts7d.length > 0
+        ? amounts7d.reduce((a, b) => a + b, 0) / amounts7d.length
+        : 0;
+
+    // Get unique devices in last 24h
+    const deviceSetKey = `user_devices:${transaction.userId}:24h`;
+    const uniqueDevices24h = await redis.scard(deviceSetKey);
 
     // Create feature array
     const features = [
@@ -109,12 +213,23 @@ export class MLService {
       dayOfWeek,
       userCount === 0 ? 1 : 0, // isNewDevice
       userCount,
-      txCount,
-      avgAmount,
+      txCount24h,
+      avgAmount24h,
+      txCount7d,
+      avgAmount7d,
+      uniqueDevices24h,
     ];
 
-    // Normalize features (you should use proper scaling based on your data)
-    const normalizedFeatures = features.map((f) => f / 1000);
+    // Normalize features using z-score normalization
+    const normalizedFeatures = features.map((feature, index) => {
+      const featureName = this.FEATURE_NAMES[index];
+      const stats =
+        this.FEATURE_STATS[featureName as keyof typeof this.FEATURE_STATS];
+      if (stats) {
+        return (feature - stats.mean) / stats.std;
+      }
+      return feature / 1000; // Fallback normalization
+    });
 
     return tf.tensor2d([normalizedFeatures], [1, this.FEATURE_NAMES.length]);
   }

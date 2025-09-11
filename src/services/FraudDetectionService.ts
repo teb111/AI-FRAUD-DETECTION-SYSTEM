@@ -1,10 +1,14 @@
 import { redis } from "../utils/database";
 import config from "../config/config";
+import Transaction from "../models/Transaction";
+import User from "../models/User";
 
 export class FraudDetectionService {
   private readonly VELOCITY_KEY_PREFIX = "velocity:";
   private readonly DEVICE_KEY_PREFIX = "device:";
   private readonly GEO_KEY_PREFIX = "geo:";
+  private readonly AMOUNT_KEY_PREFIX = "amount:";
+  private readonly IP_KEY_PREFIX = "ip:";
 
   // Check transaction velocity
   private async checkVelocity(
@@ -14,19 +18,71 @@ export class FraudDetectionService {
     const key = `${this.VELOCITY_KEY_PREFIX}${userId}`;
     const now = Date.now();
     const minuteAgo = now - 60000; // 1 minute ago
+    const hourAgo = now - 3600000; // 1 hour ago
 
     // Add transaction to sorted set with timestamp
     await redis.zadd(key, now, `${amount}:${now}`);
+    await redis.expire(key, 3600); // Expire after 1 hour
 
     // Get transactions in last minute
     const recentTxns = await redis.zrangebyscore(key, minuteAgo, now);
+    const hourlyTxns = await redis.zrangebyscore(key, hourAgo, now);
 
     if (recentTxns.length > config.thresholds.maxVelocityPerMinute) {
       return {
         score: 0.8,
-        reason: "High transaction velocity detected",
+        reason: "High transaction velocity detected (per minute)",
       };
     }
+
+    if (hourlyTxns.length > 20) {
+      // More than 20 transactions per hour
+      return {
+        score: 0.6,
+        reason: "High transaction velocity detected (per hour)",
+      };
+    }
+
+    return { score: 0 };
+  }
+
+  // Check for suspicious amount patterns
+  private async checkAmountPatterns(
+    userId: string,
+    amount: number
+  ): Promise<{ score: number; reason?: string }> {
+    const key = `${this.AMOUNT_KEY_PREFIX}${userId}`;
+    const now = Date.now();
+    const dayAgo = now - 86400000; // 24 hours ago
+
+    // Get recent amounts
+    const recentAmounts = await redis.zrangebyscore(key, dayAgo, now);
+    const amounts = recentAmounts.map((a) => parseFloat(a.split(":")[0]));
+
+    if (amounts.length > 0) {
+      const avgAmount = amounts.reduce((a, b) => a + b, 0) / amounts.length;
+      const maxAmount = Math.max(...amounts);
+
+      // Check for amount significantly higher than usual
+      if (amount > avgAmount * 10 && amount > 100000) {
+        return {
+          score: 0.7,
+          reason: "Transaction amount significantly higher than usual pattern",
+        };
+      }
+
+      // Check for round number pattern (often used in fraud)
+      if (amount % 10000 === 0 && amount >= 50000) {
+        return {
+          score: 0.3,
+          reason: "Round number transaction detected",
+        };
+      }
+    }
+
+    // Store current amount
+    await redis.zadd(key, now, `${amount}:${now}`);
+    await redis.expire(key, 86400); // Expire after 24 hours
 
     return { score: 0 };
   }
